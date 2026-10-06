@@ -21,7 +21,7 @@ public sealed class TelemetryDbContext : DbContext
             {
                 entity.ToTable("telemetry");
 
-                entity.HasKey(x => x.Id);
+                entity.HasKey(x => new { x.Id, x.Timestamp });
 
                 entity.Property(x => x.Site)
                     .HasMaxLength(50)

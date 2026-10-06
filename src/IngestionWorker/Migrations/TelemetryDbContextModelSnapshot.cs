@@ -25,10 +25,10 @@ namespace IngestionWorker.Migrations
             modelBuilder.Entity("IngestionWorker.Data.TelemetryRecord", b =>
                 {
                     b.Property<long>("Id")
-                        .ValueGeneratedOnAdd()
                         .HasColumnType("bigint");
 
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+                    b.Property<DateTimeOffset>("Timestamp")
+                        .HasColumnType("timestamp with time zone");
 
                     b.Property<string>("Line")
                         .IsRequired()
@@ -68,13 +68,10 @@ namespace IngestionWorker.Migrations
                         .HasMaxLength(20)
                         .HasColumnType("character varying(20)");
 
-                    b.Property<DateTimeOffset>("Timestamp")
-                        .HasColumnType("timestamp with time zone");
-
                     b.Property<double>("VibrationMmS")
                         .HasColumnType("double precision");
 
-                    b.HasKey("Id");
+                    b.HasKey("Id", "Timestamp");
 
                     b.HasIndex("MachineId", "Timestamp");
 

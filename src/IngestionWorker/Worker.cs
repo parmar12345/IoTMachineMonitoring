@@ -1,11 +1,11 @@
-using System.Text;
-using System.Text.Json;
 using IngestionWorker.Data;
 using IngestionWorker.Mqtt;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using MQTTnet;
 using Shared.Models;
+using System.Text;
+using System.Text.Json;
 
 namespace IngestionWorker;
 
@@ -143,54 +143,24 @@ public sealed class Worker : BackgroundService
     }
 
     private async Task ProcessTelemetryAsync(
-        CancellationToken stoppingToken)
+    CancellationToken stoppingToken)
     {
         var batch = new List<TelemetryRecord>(500);
 
         using var timer = new PeriodicTimer(
             TimeSpan.FromSeconds(1));
 
-        while (!stoppingToken.IsCancellationRequested)
+        while (await timer.WaitForNextTickAsync(stoppingToken))
         {
             batch.Clear();
 
-            while (batch.Count < 500)
+            while (
+                batch.Count < 500 &&
+                _telemetryChannel.Reader.TryRead(
+                    out var envelope))
             {
-                var readTask =
-                    _telemetryChannel.Reader.WaitToReadAsync(
-                        stoppingToken)
-                    .AsTask();
-
-                var timerTask =
-                    timer.WaitForNextTickAsync(
-                        stoppingToken)
-                    .AsTask();
-
-                var completedTask =
-                    await Task.WhenAny(
-                        readTask,
-                        timerTask);
-
-                if (completedTask == readTask)
-                {
-                    if (!await readTask)
-                    {
-                        return;
-                    }
-
-                    while (
-                        batch.Count < 500 &&
-                        _telemetryChannel.Reader.TryRead(
-                            out var envelope))
-                    {
-                        batch.Add(
-                            ConvertToRecord(envelope));
-                    }
-                }
-                else
-                {
-                    break;
-                }
+                batch.Add(
+                    ConvertToRecord(envelope));
             }
 
             if (batch.Count > 0)
