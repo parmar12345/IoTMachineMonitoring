@@ -4,6 +4,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using MQTTnet;
 using Shared.Models;
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 
@@ -142,35 +143,101 @@ public sealed class Worker : BackgroundService
         }
     }
 
+
+
     private async Task ProcessTelemetryAsync(
-    CancellationToken stoppingToken)
+        CancellationToken stoppingToken)
     {
-        var batch = new List<TelemetryRecord>(500);
+        const int batchSize = 500;
 
-        using var timer = new PeriodicTimer(
-            TimeSpan.FromSeconds(1));
+        var maxBatchWait = TimeSpan.FromSeconds(1);
 
-        while (await timer.WaitForNextTickAsync(stoppingToken))
+        var batch = new List<TelemetryRecord>(batchSize);
+
+        try
         {
-            batch.Clear();
-
-            while (
-                batch.Count < 500 &&
-                _telemetryChannel.Reader.TryRead(
-                    out var envelope))
+            while (await _telemetryChannel.Reader.WaitToReadAsync(
+                stoppingToken))
             {
-                batch.Add(
-                    ConvertToRecord(envelope));
-            }
+                batch.Clear();
 
-            if (batch.Count > 0)
-            {
-                await SaveBatchAsync(
-                    batch,
-                    stoppingToken);
+                var batchTimer = Stopwatch.StartNew();
+                var channelCompleted = false;
+
+                while (batch.Count < batchSize)
+                {
+                    // Drain all currently available records.
+                    while (
+                        batch.Count < batchSize &&
+                        _telemetryChannel.Reader.TryRead(
+                            out var envelope))
+                    {
+                        batch.Add(ConvertToRecord(envelope));
+                    }
+
+                    // Save immediately when the batch reaches 500.
+                    if (batch.Count >= batchSize)
+                    {
+                        break;
+                    }
+
+                    // Flush a partial batch after the maximum wait.
+                    var remaining =
+                        maxBatchWait - batchTimer.Elapsed;
+
+                    if (remaining <= TimeSpan.Zero)
+                    {
+                        break;
+                    }
+
+                    // Wait for more data instead of polling every second.
+                    using var waitCts =
+                        CancellationTokenSource
+                            .CreateLinkedTokenSource(stoppingToken);
+
+                    waitCts.CancelAfter(remaining);
+
+                    try
+                    {
+                        var hasMoreData =
+                            await _telemetryChannel.Reader
+                                .WaitToReadAsync(waitCts.Token);
+
+                        if (!hasMoreData)
+                        {
+                            channelCompleted = true;
+                            break;
+                        }
+                    }
+                    catch (OperationCanceledException)
+                        when (!stoppingToken.IsCancellationRequested)
+                    {
+                        // The batch collection timeout expired.
+                        break;
+                    }
+                }
+
+                if (batch.Count > 0)
+                {
+                    await SaveBatchAsync(
+                        batch,
+                        stoppingToken);
+                }
+
+                if (channelCompleted)
+                {
+                    break;
+                }
             }
         }
+        catch (OperationCanceledException)
+            when (stoppingToken.IsCancellationRequested)
+        {
+            _logger.LogInformation(
+                "Telemetry batch processing is stopping.");
+        }
     }
+
 
     private static TelemetryRecord ConvertToRecord(
         TelemetryEnvelope envelope)
@@ -194,23 +261,152 @@ public sealed class Worker : BackgroundService
         };
     }
 
-    private async Task SaveBatchAsync(
-        List<TelemetryRecord> batch,
-        CancellationToken stoppingToken)
+
+ 
+private async Task SaveBatchAsync(
+    List<TelemetryRecord> batch,
+    CancellationToken stoppingToken)
     {
-        await using var db =
-            await _dbContextFactory.CreateDbContextAsync(
+        var batchCount = batch.Count;
+        var stopwatch = Stopwatch.StartNew();
+
+        try
+        {
+            await using var db =
+                await _dbContextFactory.CreateDbContextAsync(
+                    stoppingToken);
+
+            // Keep historical inserts and latest-state updates
+            // in one transaction.
+            await using var transaction =
+                await db.Database.BeginTransactionAsync(
+                    stoppingToken);
+
+            // 1. Save every telemetry record to historical storage.
+            await db.Telemetry.AddRangeAsync(
+                batch,
                 stoppingToken);
 
-        await db.Telemetry.AddRangeAsync(
-            batch,
-            stoppingToken);
+            await db.SaveChangesAsync(stoppingToken);
 
-        await db.SaveChangesAsync(
-            stoppingToken);
+            // 2. Keep only the newest record per machine in this batch.
+            // This avoids duplicate conflict keys in a single INSERT.
+            var latestPerMachine = batch
+                .GroupBy(x => new
+                {
+                    x.Site,
+                    x.Line,
+                    x.MachineId
+                })
+                .Select(group => group
+                    .OrderByDescending(x => x.Timestamp)
+                    .ThenByDescending(x => x.Sequence)
+                    .First())
+                .ToList();
+
+            // 3. Build one parameterized PostgreSQL upsert.
+            var sql = new StringBuilder();
+            var parameters = new List<object>();
+
+            sql.Append("""
+            INSERT INTO public.machine_latest_telemetry AS current
+            (
+                "Id", "Site", "Line", "MachineId",
+                "Timestamp", "Sequence", "State",
+                "SpindleSpeedRpm", "SpindleLoadPct",
+                "SpindleTempC", "VibrationMmS",
+                "PowerKw", "PartCount"
+            )
+            VALUES
+            """);
+
+            for (var i = 0; i < latestPerMachine.Count; i++)
+            {
+                var record = latestPerMachine[i];
+
+                if (i > 0)
+                {
+                    sql.Append(',');
+                }
+
+                sql.Append('(');
+
+                var values = new object[]
+                {
+                record.Id,
+                record.Site,
+                record.Line,
+                record.MachineId,
+                record.Timestamp,
+                record.Sequence,
+                record.State,
+                record.SpindleSpeedRpm,
+                record.SpindleLoadPct,
+                record.SpindleTempC,
+                record.VibrationMmS,
+                record.PowerKw,
+                record.PartCount
+                };
+
+                for (var j = 0; j < values.Length; j++)
+                {
+                    if (j > 0)
+                    {
+                        sql.Append(", ");
+                    }
+
+                    var parameterName = $"p{parameters.Count}";
+
+                    sql.Append('@').Append(parameterName);
+
+                    parameters.Add(
+                        new Npgsql.NpgsqlParameter(
+                            parameterName,
+                            values[j]));
+                }
+
+                sql.Append(')');
+            }
+
+            sql.Append("""
+            
+            ON CONFLICT ("Site", "Line", "MachineId")
+            DO UPDATE SET
+                "Id" = EXCLUDED."Id",
+                "Timestamp" = EXCLUDED."Timestamp",
+                "Sequence" = EXCLUDED."Sequence",
+                "State" = EXCLUDED."State",
+                "SpindleSpeedRpm" = EXCLUDED."SpindleSpeedRpm",
+                "SpindleLoadPct" = EXCLUDED."SpindleLoadPct",
+                "SpindleTempC" = EXCLUDED."SpindleTempC",
+                "VibrationMmS" = EXCLUDED."VibrationMmS",
+                "PowerKw" = EXCLUDED."PowerKw",
+                "PartCount" = EXCLUDED."PartCount"
+            WHERE
+                (EXCLUDED."Timestamp", EXCLUDED."Sequence")
+                >
+                (current."Timestamp", current."Sequence");
+            """);
+
+            await db.Database.ExecuteSqlRawAsync(
+                sql.ToString(),
+                parameters,
+                stoppingToken);
+
+            await transaction.CommitAsync(stoppingToken);
+        }
+        finally
+        {
+            stopwatch.Stop();
+        }
 
         _logger.LogInformation(
-            "Saved {Count} telemetry records to PostgreSQL.",
-            batch.Count);
+            "Saved {Count} telemetry records to PostgreSQL in " +
+            "{DurationMs:F2} ms. Queue depth: {QueueDepth}.",
+            batchCount,
+            stopwatch.Elapsed.TotalMilliseconds,
+            _telemetryChannel.Count);
     }
+
+
 }

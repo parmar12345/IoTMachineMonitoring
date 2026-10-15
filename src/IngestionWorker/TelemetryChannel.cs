@@ -21,4 +21,9 @@ public sealed class TelemetryChannel
     public ChannelWriter<TelemetryEnvelope> Writer => _channel.Writer;
 
     public ChannelReader<TelemetryEnvelope> Reader => _channel.Reader;
+
+    public int Count =>
+        _channel.Reader.CanCount
+            ? _channel.Reader.Count
+            : -1;
 }

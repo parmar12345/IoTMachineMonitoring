@@ -1,9 +1,11 @@
+
 using IngestionWorker;
 using IngestionWorker.Data;
 using IngestionWorker.Mqtt;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
 var builder = Host.CreateApplicationBuilder(args);
 
@@ -15,7 +17,13 @@ var connectionString =
 
 builder.Services.AddPooledDbContextFactory<TelemetryDbContext>(
     options =>
-        options.UseNpgsql(connectionString));
+    {
+        options.UseNpgsql(connectionString);
+
+        options.LogTo(
+     Console.WriteLine,
+     LogLevel.Warning);
+    });
 
 builder.Services.AddSingleton<TelemetryChannel>();
 

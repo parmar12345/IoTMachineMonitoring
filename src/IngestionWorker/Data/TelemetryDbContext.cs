@@ -13,6 +13,7 @@ public sealed class TelemetryDbContext : DbContext
     public DbSet<TelemetryRecord> Telemetry =>
         Set<TelemetryRecord>();
 
+
     protected override void OnModelCreating(
         ModelBuilder modelBuilder)
     {
@@ -22,6 +23,9 @@ public sealed class TelemetryDbContext : DbContext
                 entity.ToTable("telemetry");
 
                 entity.HasKey(x => new { x.Id, x.Timestamp });
+
+                entity.Property(x => x.Id)
+                    .ValueGeneratedOnAdd();
 
                 entity.Property(x => x.Site)
                     .HasMaxLength(50)
@@ -46,4 +50,5 @@ public sealed class TelemetryDbContext : DbContext
                 });
             });
     }
+
 }

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Options;
@@ -46,8 +47,7 @@ public sealed class Worker : BackgroundService
             options,
             stoppingToken);
 
-        _logger.LogInformation(
-            "Connected to MQTT broker.");
+        _logger.LogInformation("Connected to MQTT broker.");
 
         var machines = CreateMachines();
 
@@ -55,50 +55,79 @@ public sealed class Worker : BackgroundService
             "Created {MachineCount} simulated machines.",
             machines.Count);
 
-        while (!stoppingToken.IsCancellationRequested)
+        long publishedCount = 0;
+        var lastReport = Stopwatch.StartNew();
+
+        try
         {
-            foreach (var machine in machines)
+            while (!stoppingToken.IsCancellationRequested)
             {
-                machine.Update();
+                var cycleStopwatch = Stopwatch.StartNew();
 
-                var telemetry = new TelemetryMessage
+                foreach (var machine in machines)
                 {
-                    V = 1,
-                    Ts = DateTimeOffset.UtcNow,
-                    Seq = machine.Sequence,
-                    State = machine.State,
-                    SpindleSpeedRpm = machine.SpindleSpeedRpm,
-                    SpindleLoadPct = machine.SpindleLoadPct,
-                    SpindleTempC = machine.SpindleTempC,
-                    VibrationMmS = machine.VibrationMmS,
-                    PowerKw = machine.PowerKw,
-                    PartCount = machine.PartCount
-                };
+                    machine.Update();
 
-                var json = JsonSerializer.Serialize(telemetry);
+                    var telemetry = new TelemetryMessage
+                    {
+                        V = 1,
+                        Ts = DateTimeOffset.UtcNow,
+                        Seq = machine.Sequence,
+                        State = machine.State,
+                        SpindleSpeedRpm = machine.SpindleSpeedRpm,
+                        SpindleLoadPct = machine.SpindleLoadPct,
+                        SpindleTempC = machine.SpindleTempC,
+                        VibrationMmS = machine.VibrationMmS,
+                        PowerKw = machine.PowerKw,
+                        PartCount = machine.PartCount
+                    };
 
-                var topic =
-                    $"factory/{machine.Site}/{machine.Line}/{machine.MachineId}/telemetry";
+                    var json = JsonSerializer.Serialize(telemetry);
 
-                var message = new MqttApplicationMessageBuilder()
-                    .WithTopic(topic)
-                    .WithPayload(Encoding.UTF8.GetBytes(json))
-                    .Build();
+                    var topic =
+                        $"factory/{machine.Site}/{machine.Line}/{machine.MachineId}/telemetry";
 
-                await mqttClient.PublishAsync(
-                    message,
-                    stoppingToken);
+                    var message = new MqttApplicationMessageBuilder()
+                        .WithTopic(topic)
+                        .WithPayload(Encoding.UTF8.GetBytes(json))
+                        .Build();
 
-                _logger.LogInformation(
-                    "Published {MachineId} seq {Sequence} state {State}",
-                    machine.MachineId,
-                    machine.Sequence,
-                    machine.State);
+                    await mqttClient.PublishAsync(
+                        message,
+                        stoppingToken);
+
+                    publishedCount++;
+                }
+
+                if (lastReport.Elapsed.TotalSeconds >= 10)
+                {
+                    _logger.LogInformation(
+                        "Simulator publish rate: {Rate:F2} messages/sec",
+                        publishedCount / lastReport.Elapsed.TotalSeconds);
+
+                    publishedCount = 0;
+                    lastReport.Restart();
+                }
+
+                cycleStopwatch.Stop();
+
+                var interval = TimeSpan.FromMilliseconds(
+                    _simulatorOptions.PublishIntervalMs);
+
+                var remainingTime = interval - cycleStopwatch.Elapsed;
+
+                if (remainingTime > TimeSpan.Zero)
+                {
+                    await Task.Delay(
+                        remainingTime,
+                        stoppingToken);
+                }
             }
-
-            await Task.Delay(
-                _simulatorOptions.PublishIntervalMs,
-                stoppingToken);
+        }
+        catch (OperationCanceledException)
+            when (stoppingToken.IsCancellationRequested)
+        {
+            _logger.LogInformation("Simulator is stopping.");
         }
     }
 
@@ -111,19 +140,17 @@ public sealed class Worker : BackgroundService
              i++)
         {
             var lineNumber = ((i - 1) / 25) + 1;
-
             var machineNumber = ((i - 1) % 25) + 1;
 
             var line = $"line-{lineNumber}";
-
             var machineId = $"cnc-{machineNumber:000}";
 
             machines.Add(
-     new MachineSimulator(
-         "ahm-01",
-         line,
-         machineId,
-         _simulatorOptions.FaultProbability));
+                new MachineSimulator(
+                    "ahm-01",
+                    line,
+                    machineId,
+                    _simulatorOptions.FaultProbability));
         }
 
         return machines;
